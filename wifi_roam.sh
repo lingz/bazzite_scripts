@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# wifi_roam.sh
+# Robust, idempotent Wi-Fi BSSID lock/unlock/status/toggle for NetworkManager
+# Fixes nmcli escaped colons (\:) so status reports correctly.
+
 DEBUG=0
 if [[ "${1:-}" == "--debug" ]]; then
   DEBUG=1
@@ -12,6 +16,11 @@ dbg() { [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: $*" >&2 || true; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+# nmcli sometimes escapes colons as "\:" in certain outputs.
+normalize_bssid() {
+  echo "${1:-}" | sed 's/\\:/:/g'
+}
 
 # Active connected Wi-Fi device
 get_wifi_dev() {
@@ -46,22 +55,21 @@ get_locked_bssid_by_uuid() {
   nmcli -g 802-11-wireless.bssid connection show uuid "$uuid" 2>/dev/null | head -n1
 }
 
+# Helpful: show duplicates (multiple profiles with same ID)
+show_matching_profiles() {
+  local id="$1"
+  nmcli -t -f NAME,UUID,TYPE connection show \
+    | awk -F: -v id="$id" '$1==id {print}'
+}
+
 is_mac() {
   [[ "${1:-}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
 }
 
 bounce_conn_uuid() {
   local uuid="$1"
-  # "down/up uuid" ensures we reactivate exactly this profile
   nmcli connection down uuid "$uuid" >/dev/null 2>&1 || true
   nmcli connection up uuid "$uuid" >/dev/null 2>&1 || true
-}
-
-# Helpful: show duplicates (multiple profiles with same ID)
-show_matching_profiles() {
-  local id="$1"
-  nmcli -t -f NAME,UUID,TYPE connection show \
-    | awk -F: -v id="$id" '$1==id {print}'
 }
 
 status() {
@@ -76,6 +84,9 @@ status() {
   uuid="$(get_active_conn_uuid "$dev")"
   cur="$(get_current_bssid "$dev" || true)"
   locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+
+  cur="$(normalize_bssid "$cur")"
+  locked="$(normalize_bssid "$locked")"
 
   [[ -n "${cur:-}" ]] || cur="-"
   [[ -n "${locked:-}" ]] || locked="-"
@@ -116,10 +127,12 @@ lock() {
   [[ -n "${uuid:-}" && "$uuid" != "--" ]] || die "Could not get active connection UUID."
 
   cur="$(get_current_bssid "$dev" || true)"
+  cur="$(normalize_bssid "$cur")"
   [[ -n "${cur:-}" ]] || die "Could not determine current BSSID (install 'iw' to avoid scans)."
   is_mac "$cur" || die "Current BSSID doesn't look valid: $cur"
 
   locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  locked="$(normalize_bssid "$locked")"
 
   if is_mac "$locked" && [[ "${locked,,}" == "${cur,,}" ]]; then
     log "Already locked ✅ (${cur})"
@@ -129,19 +142,22 @@ lock() {
   log "Locking '${id}' (uuid ${uuid}) to BSSID ${cur} ..."
   nmcli connection modify uuid "$uuid" 802-11-wireless.bssid "$cur"
 
-  # Verify it actually set
+  # Verify it set
   locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  locked="$(normalize_bssid "$locked")"
   dbg "after_set_locked=$locked"
 
   # Reconnect to apply
   bounce_conn_uuid "$uuid"
 
   locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  locked="$(normalize_bssid "$locked")"
+
   if is_mac "$locked"; then
     log "Locked ✅ (${locked})"
   else
-    log "Locked command ran, but NM still reports no bssid lock."
-    log "Run: ./wifi_roam.sh --debug status  (and check the DEBUG output)"
+    log "Lock command ran, but NM still reports no bssid lock."
+    log "Run: $0 --debug status"
   fi
 }
 
@@ -158,6 +174,7 @@ unlock() {
   [[ -n "${uuid:-}" && "$uuid" != "--" ]] || die "Could not get active connection UUID."
 
   locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  locked="$(normalize_bssid "$locked")"
 
   if ! is_mac "$locked"; then
     log "Already unlocked ✅"
