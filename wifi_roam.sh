@@ -1,131 +1,183 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEBUG=0
+if [[ "${1:-}" == "--debug" ]]; then
+  DEBUG=1
+  shift
+fi
+
+log() { echo "$*"; }
+dbg() { [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: $*" >&2 || true; }
 die() { echo "ERROR: $*" >&2; exit 1; }
+
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
+# Active connected Wi-Fi device
 get_wifi_dev() {
   nmcli -t -f DEVICE,TYPE,STATE dev status \
     | awk -F: '$2=="wifi" && $3=="connected" {print $1; exit}'
 }
 
-get_conn_name() {
+# Active connection ID (human name) + UUID (true identity)
+get_active_conn_id() {
   local dev="$1"
   nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null | head -n1
 }
 
+get_active_conn_uuid() {
+  local dev="$1"
+  nmcli -g GENERAL.CON-UUID device show "$dev" 2>/dev/null | head -n1
+}
+
+# Current BSSID (prefer iw to avoid scans)
 get_current_bssid() {
   local dev="$1"
   if command -v iw >/dev/null 2>&1; then
     iw dev "$dev" link 2>/dev/null | awk '/Connected to/ {print $3; exit}'
   else
-    # Fallback (may trigger scans on some setups)
     nmcli -t -f ACTIVE,BSSID dev wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}'
   fi
 }
 
-get_locked_bssid() {
-  local conn="$1"
-  nmcli -g 802-11-wireless.bssid connection show "$conn" 2>/dev/null | head -n1
+# Read lock state from NM profile by UUID
+get_locked_bssid_by_uuid() {
+  local uuid="$1"
+  nmcli -g 802-11-wireless.bssid connection show uuid "$uuid" 2>/dev/null | head -n1
 }
 
 is_mac() {
   [[ "${1:-}" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
 }
 
-bounce_conn() {
-  local conn="$1"
-  nmcli connection down "$conn" >/dev/null 2>&1 || true
-  nmcli connection up "$conn" >/dev/null 2>&1 || true
+bounce_conn_uuid() {
+  local uuid="$1"
+  # "down/up uuid" ensures we reactivate exactly this profile
+  nmcli connection down uuid "$uuid" >/dev/null 2>&1 || true
+  nmcli connection up uuid "$uuid" >/dev/null 2>&1 || true
 }
 
-status_line() {
+# Helpful: show duplicates (multiple profiles with same ID)
+show_matching_profiles() {
+  local id="$1"
+  nmcli -t -f NAME,UUID,TYPE connection show \
+    | awk -F: -v id="$id" '$1==id {print}'
+}
+
+status() {
   need_cmd nmcli
-  local dev conn ssid cur locked
+
+  local dev id uuid cur locked
 
   dev="$(get_wifi_dev || true)"
-  [[ -n "${dev:-}" ]] || { echo "Wi-Fi: DISCONNECTED"; return 0; }
+  [[ -n "${dev:-}" ]] || { log "Wi-Fi: DISCONNECTED"; return 0; }
 
-  conn="$(get_conn_name "$dev")"
-  ssid="$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null | head -n1 || true)"
+  id="$(get_active_conn_id "$dev")"
+  uuid="$(get_active_conn_uuid "$dev")"
   cur="$(get_current_bssid "$dev" || true)"
-  locked="$(get_locked_bssid "$conn" || true)"
+  locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
 
   [[ -n "${cur:-}" ]] || cur="-"
   [[ -n "${locked:-}" ]] || locked="-"
-  [[ -n "${ssid:-}" ]] || ssid="(unknown)"
+  [[ -n "${id:-}" ]] || id="(unknown)"
+  [[ -n "${uuid:-}" ]] || uuid="(unknown)"
+
+  if [[ "$DEBUG" -eq 1 ]]; then
+    dbg "dev=$dev"
+    dbg "active_id=$id"
+    dbg "active_uuid=$uuid"
+    dbg "current_bssid=$cur"
+    dbg "locked_bssid(field)=$locked"
+    dbg "profiles_with_same_name:"
+    show_matching_profiles "$id" | sed 's/^/DEBUG:   /' >&2 || true
+  fi
 
   if is_mac "$locked"; then
     if [[ "$cur" != "-" && "${locked,,}" == "${cur,,}" ]]; then
-      echo "Wi-Fi: LOCKED ✅  SSID='${ssid}'  BSSID=${cur}"
+      log "Wi-Fi: LOCKED ✅  SSID='${id}'  BSSID=${cur}"
     else
-      echo "Wi-Fi: LOCKED ⚠️  SSID='${ssid}'  Locked=${locked}  Current=${cur}"
+      log "Wi-Fi: LOCKED ⚠️  SSID='${id}'  Locked=${locked}  Current=${cur}"
     fi
   else
-    echo "Wi-Fi: UNLOCKED  SSID='${ssid}'  Current BSSID=${cur}"
+    log "Wi-Fi: UNLOCKED  SSID='${id}'  Current BSSID=${cur}"
   fi
 }
 
-do_lock() {
+lock() {
   need_cmd nmcli
-  local dev conn cur locked
+
+  local dev id uuid cur locked
 
   dev="$(get_wifi_dev || true)"
   [[ -n "${dev:-}" ]] || die "Wi-Fi is not connected."
 
-  conn="$(get_conn_name "$dev")"
-  [[ -n "${conn:-}" ]] || die "Could not find active NM connection profile."
+  id="$(get_active_conn_id "$dev")"
+  uuid="$(get_active_conn_uuid "$dev")"
+  [[ -n "${uuid:-}" && "$uuid" != "--" ]] || die "Could not get active connection UUID."
 
   cur="$(get_current_bssid "$dev" || true)"
-  [[ -n "${cur:-}" ]] || die "Could not determine current BSSID (install 'iw' for best results)."
+  [[ -n "${cur:-}" ]] || die "Could not determine current BSSID (install 'iw' to avoid scans)."
   is_mac "$cur" || die "Current BSSID doesn't look valid: $cur"
 
-  locked="$(get_locked_bssid "$conn" || true)"
+  locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
 
-  # Idempotent: already locked to this AP
   if is_mac "$locked" && [[ "${locked,,}" == "${cur,,}" ]]; then
-    echo "Already locked ✅  (${cur})"
+    log "Already locked ✅ (${cur})"
     return 0
   fi
 
-  echo "Locking '${conn}' to BSSID ${cur} ..."
-  nmcli connection modify "$conn" 802-11-wireless.bssid "$cur"
-  bounce_conn "$conn"
-  echo "Locked ✅  (${cur})"
+  log "Locking '${id}' (uuid ${uuid}) to BSSID ${cur} ..."
+  nmcli connection modify uuid "$uuid" 802-11-wireless.bssid "$cur"
+
+  # Verify it actually set
+  locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  dbg "after_set_locked=$locked"
+
+  # Reconnect to apply
+  bounce_conn_uuid "$uuid"
+
+  locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
+  if is_mac "$locked"; then
+    log "Locked ✅ (${locked})"
+  else
+    log "Locked command ran, but NM still reports no bssid lock."
+    log "Run: ./wifi_roam.sh --debug status  (and check the DEBUG output)"
+  fi
 }
 
-do_unlock() {
+unlock() {
   need_cmd nmcli
-  local dev conn locked
+
+  local dev id uuid locked
 
   dev="$(get_wifi_dev || true)"
-  [[ -n "${dev:-}" ]] || { echo "Wi-Fi disconnected; nothing to unlock."; return 0; }
+  [[ -n "${dev:-}" ]] || { log "Wi-Fi disconnected; nothing to unlock."; return 0; }
 
-  conn="$(get_conn_name "$dev")"
-  [[ -n "${conn:-}" ]] || die "Could not find active NM connection profile."
+  id="$(get_active_conn_id "$dev")"
+  uuid="$(get_active_conn_uuid "$dev")"
+  [[ -n "${uuid:-}" && "$uuid" != "--" ]] || die "Could not get active connection UUID."
 
-  locked="$(get_locked_bssid "$conn" || true)"
+  locked="$(get_locked_bssid_by_uuid "$uuid" || true)"
 
-  # Idempotent: already unlocked
   if ! is_mac "$locked"; then
-    echo "Already unlocked ✅"
+    log "Already unlocked ✅"
     return 0
   fi
 
-  echo "Unlocking '${conn}' (clearing BSSID ${locked}) ..."
-  nmcli connection modify "$conn" 802-11-wireless.bssid ""
-  bounce_conn "$conn"
-  echo "Unlocked ✅"
+  log "Unlocking '${id}' (uuid ${uuid}) (clearing BSSID ${locked}) ..."
+  nmcli connection modify uuid "$uuid" 802-11-wireless.bssid ""
+  bounce_conn_uuid "$uuid"
+  log "Unlocked ✅"
 }
 
-do_toggle() {
-  local line
-  line="$(status_line)"
-  echo "$line"
-  if echo "$line" | grep -q "Wi-Fi: LOCKED"; then
-    do_unlock
-  elif echo "$line" | grep -q "Wi-Fi: UNLOCKED"; then
-    do_lock
+toggle() {
+  local out
+  out="$(status)"
+  log "$out"
+  if echo "$out" | grep -q "Wi-Fi: LOCKED"; then
+    unlock
+  elif echo "$out" | grep -q "Wi-Fi: UNLOCKED"; then
+    lock
   else
     die "Can't toggle: Wi-Fi not connected."
   fi
@@ -133,23 +185,18 @@ do_toggle() {
 
 usage() {
   cat <<EOF
-Usage: $0 {status|lock|unlock|toggle}
-  status : show lock state
-  lock   : lock to current connected BSSID (idempotent)
-  unlock : clear lock (idempotent)
-  toggle : lock if unlocked, unlock if locked
+Usage: $0 [--debug] {status|lock|unlock|toggle}
+  --debug : print extra info to stderr (active UUID, duplicates, etc)
+  status  : show lock state
+  lock    : lock to current connected BSSID (idempotent)
+  unlock  : clear lock (idempotent)
+  toggle  : lock if unlocked, unlock if locked
 EOF
 }
 
-main() {
-  local cmd="${1:-status}"
-  case "$cmd" in
-    status)  status_line ;;
-    lock)    do_lock ;;
-    unlock)  do_unlock ;;
-    toggle)  do_toggle ;;
-    *) usage; exit 2 ;;
-  esac
-}
-
-main "$@"
+cmd="${1:-status}"
+case "$cmd" in
+  status|lock|unlock|toggle) "$cmd" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 2 ;;
+esac
